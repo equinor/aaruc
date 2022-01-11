@@ -1,0 +1,13 @@
+domain: my.domain
+layout:
+- go.kubebuilder.io/v3
+projectName: azure-app-controller
+repo: app.example.com/m/v2
+resources:
+- controller: true
+  domain: k8s.io
+  group: networking
+  kind: Ingress
+  path: k8s.io/api/networking/v1
+  version: v1
+version: "3"
