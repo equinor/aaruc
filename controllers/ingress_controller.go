@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"sync"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,6 +26,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+var db = &sync.Map{}
 
 // IngressReconciler reconciles a Ingress object
 type IngressReconciler struct {
@@ -46,15 +49,34 @@ type IngressReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.10.0/pkg/reconcile
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
+	l := log.FromContext(ctx)
 
-	// TODO(user): your logic here
+	i := new(networkingv1.Ingress)
+	err := r.Client.Get(ctx, req.NamespacedName, i)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	_, ok := i.Annotations["azure-app-registration"]
+	if ok {
+		// add reply-url
+		db.Store(req.NamespacedName, i.Spec.Rules[0].Host)
+		l.Info("Added reply-url", "Resource Name", req.Name, "Host", i.Spec.Rules[0].Host)
+	} else {
+		// check if an entry is in db
+		host, ok := db.LoadAndDelete(req.NamespacedName)
+		if ok {
+			// if a value for the resource was present, then the annotation must have been removed
+			l.Info("Removed reply-url", "Resource Name", req.Name, "Host", host)
+		}
+	}
 
 	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	db = new(sync.Map)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
 		Complete(r)
