@@ -18,9 +18,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	a "github.com/microsoft/kiota/authentication/go/azure"
+	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
+
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -76,9 +81,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// create Azure client from cli cred
+	cred, err := azidentity.NewAzureCLICredential(new(azidentity.AzureCLICredentialOptions))
+	if err != nil {
+		fmt.Printf("Error creating credentials: %v\n", err)
+	}
+
+	auth, err := a.NewAzureIdentityAuthenticationProvider(cred)
+	if err != nil {
+		fmt.Printf("Error authentication provider: %v\n", err)
+		return
+	}
+
+	adapter, err := msgraphsdk.NewGraphRequestAdapter(auth)
+	if err != nil {
+		fmt.Printf("Error creating adapter: %v\n", err)
+		return
+	}
+	graphClient := msgraphsdk.NewGraphServiceClient(adapter)
+
 	if err = (&controllers.IngressReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		GraphClient: graphClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
 		os.Exit(1)

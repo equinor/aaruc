@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -25,6 +26,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
+	"github.com/microsoftgraph/msgraph-sdk-go/applications/item"
 )
 
 var db = &sync.Map{}
@@ -32,7 +36,8 @@ var db = &sync.Map{}
 // IngressReconciler reconciles a Ingress object
 type IngressReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme      *runtime.Scheme
+	GraphClient *msgraphsdk.GraphServiceClient
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
@@ -57,17 +62,66 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	_, ok := i.Annotations["azure-app-registration"]
+	id, ok := i.Annotations["azure-app-registration"]
 	if ok {
 		// add reply-url
-		db.Store(req.NamespacedName, i.Spec.Rules[0].Host)
-		l.Info("Added reply-url", "Resource Name", req.Name, "Host", i.Spec.Rules[0].Host)
+		host := i.Spec.Rules[0].Host
+
+		app, err := r.GraphClient.ApplicationsById(id).Get(nil)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		pc := app.GetWeb()
+		pc.SetRedirectUris(append(
+			app.GetWeb().GetRedirectUris(),
+			host,
+		))
+		app.SetWeb(pc)
+
+		reqOpts := item.ApplicationRequestBuilderPatchOptions{
+			Body: app,
+		}
+		err = r.GraphClient.ApplicationsById(id).Patch(&reqOpts)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		db.Store(req.NamespacedName, host)
+		l.Info("Added reply-url", "Resource Name", req.Name, "Host", host)
 	} else {
 		// check if an entry is in db
-		host, ok := db.LoadAndDelete(req.NamespacedName)
+		v, ok := db.Load(req.NamespacedName)
 		if ok {
 			// if a value for the resource was present, then the annotation must have been removed
-			l.Info("Removed reply-url", "Resource Name", req.Name, "Host", host)
+			host := v.(string)
+
+			app, err := r.GraphClient.ApplicationsById(id).Get(nil)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
+			URIs := app.GetWeb().GetRedirectUris()
+			sort.Strings(URIs)
+			i := sort.SearchStrings(URIs, host)
+			if i < len(URIs) {
+				pc := app.GetWeb()
+				pc.SetRedirectUris(
+					append(URIs[:i], URIs[i+1:]...),
+				)
+				app.SetWeb(pc)
+
+				reqOpts := item.ApplicationRequestBuilderPatchOptions{
+					Body: app,
+				}
+				err = r.GraphClient.ApplicationsById(id).Patch(&reqOpts)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				db.Delete(req.NamespacedName)
+				l.Info("Removed reply-url", "Resource Name", req.Name, "Host", host)
+			}
+
 		}
 	}
 
