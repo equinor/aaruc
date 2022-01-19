@@ -17,9 +17,9 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"sort"
-	"sync"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,17 +27,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"git.mills.io/prologic/bitcask"
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/microsoftgraph/msgraph-sdk-go/applications/item"
 )
 
-var db = &sync.Map{}
+const dbPath string = "./db"
 
 // IngressReconciler reconciles a Ingress object
 type IngressReconciler struct {
 	client.Client
 	Scheme      *runtime.Scheme
 	GraphClient *msgraphsdk.GraphServiceClient
+	db          *bitcask.Bitcask
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
@@ -56,6 +58,7 @@ type IngressReconciler struct {
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
+	key := []byte(req.NamespacedName.String())
 	i := new(networkingv1.Ingress)
 	err := r.Client.Get(ctx, req.NamespacedName, i)
 	if err != nil {
@@ -65,63 +68,59 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	id, ok := i.Annotations["azure-app-registration"]
 	if ok {
 		// add reply-url
-		host := i.Spec.Rules[0].Host
+		host := "https://" + i.Spec.Rules[0].Host
 
 		app, err := r.GraphClient.ApplicationsById(id).Get(nil)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
-		pc := app.GetWeb()
-		pc.SetRedirectUris(append(
-			app.GetWeb().GetRedirectUris(),
-			host,
-		))
-		app.SetWeb(pc)
+		Uris := append(app.GetWeb().GetRedirectUris(), host)
 
-		reqOpts := item.ApplicationRequestBuilderPatchOptions{
-			Body: app,
-		}
-		err = r.GraphClient.ApplicationsById(id).Patch(&reqOpts)
+		err = r.GraphClient.ApplicationsById(id).Patch(
+			&item.ApplicationRequestBuilderPatchOptions{
+				Body: NewUpdateRedirectUrisRequestBody(Uris),
+			},
+		)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
-		db.Store(req.NamespacedName, host)
+		e := &Entry{AppId: id, Uri: host}
+		b, _ := e.Serialize()
+		r.db.Put(key, b.Bytes())
 		l.Info("Added reply-url", "Resource Name", req.Name, "Host", host)
 	} else {
 		// check if an entry is in db
-		v, ok := db.Load(req.NamespacedName)
-		if ok {
+		data, _ := r.db.Get(key)
+		if len(data) != 0 {
 			// if a value for the resource was present, then the annotation must have been removed
-			host := v.(string)
+			e, err := DecodeEntry(bytes.NewBuffer(data))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			host := e.Uri
 
-			app, err := r.GraphClient.ApplicationsById(id).Get(nil)
+			app, err := r.GraphClient.ApplicationsById(e.AppId).Get(nil)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 
-			URIs := app.GetWeb().GetRedirectUris()
-			sort.Strings(URIs)
-			i := sort.SearchStrings(URIs, host)
-			if i < len(URIs) {
-				pc := app.GetWeb()
-				pc.SetRedirectUris(
-					append(URIs[:i], URIs[i+1:]...),
+			Uris := app.GetWeb().GetRedirectUris()
+			sort.Strings(Uris)
+			i := sort.SearchStrings(Uris, host)
+			if i < len(Uris) {
+				err = r.GraphClient.ApplicationsById(e.AppId).Patch(
+					&item.ApplicationRequestBuilderPatchOptions{
+						Body: NewUpdateRedirectUrisRequestBody(append(Uris[:i], Uris[i+1:]...)),
+					},
 				)
-				app.SetWeb(pc)
-
-				reqOpts := item.ApplicationRequestBuilderPatchOptions{
-					Body: app,
-				}
-				err = r.GraphClient.ApplicationsById(id).Patch(&reqOpts)
 				if err != nil {
 					return ctrl.Result{}, err
 				}
-				db.Delete(req.NamespacedName)
+				r.db.Delete(key)
 				l.Info("Removed reply-url", "Resource Name", req.Name, "Host", host)
 			}
-
 		}
 	}
 
@@ -130,7 +129,13 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	db = new(sync.Map)
+	dbPtr, err := bitcask.Open(dbPath)
+	if err != nil {
+		return err
+	}
+
+	r.db = dbPtr
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
 		Complete(r)
