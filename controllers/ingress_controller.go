@@ -23,9 +23,11 @@ import (
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"git.mills.io/prologic/bitcask"
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
@@ -58,83 +60,165 @@ type IngressReconciler struct {
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
-	key := []byte(req.NamespacedName.String())
-	i := new(networkingv1.Ingress)
-	err := r.Client.Get(ctx, req.NamespacedName, i)
-	if err != nil {
-		return ctrl.Result{}, err
+	// check the database
+	entry, dbErr := r.Get(req.NamespacedName)
+	if dbErr != nil {
+		return ctrl.Result{}, dbErr
 	}
 
-	id, ok := i.Annotations["azure-app-registration"]
+	ingress := new(networkingv1.Ingress)
+	r.Client.Get(ctx, req.NamespacedName, ingress)
+	appObjectID, ok := ingress.Annotations["azure-app-registration"]
+
 	if ok {
-		// add reply-url
-		host := "https://" + i.Spec.Rules[0].Host
-
-		app, err := r.GraphClient.ApplicationsById(id).Get(nil)
+		replyUrls := GetHostsFromIngress(ingress)
+		entry := Entry{AppId: appObjectID, ReplyUrls: replyUrls}
+		appReplyUrls, err := r.getReplyUrls(entry.AppId)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
-		Uris := append(app.GetWeb().GetRedirectUris(), host)
+		sort.Strings(replyUrls)
+		sort.Strings(appReplyUrls)
+		diff, result := MergeStringArrays(replyUrls, appReplyUrls)
+		if len(diff) > 0 {
+			err = r.updateReplyUrl(result, entry.AppId)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 
-		err = r.GraphClient.ApplicationsById(id).Patch(
-			&item.ApplicationRequestBuilderPatchOptions{
-				Body: NewUpdateRedirectUrisRequestBody(Uris),
-			},
-		)
+			l.Info("Added reply-urls", "Resource Name", req.Name, "Reply URLs", diff)
+		}
+
+		if err = r.Put(req.NamespacedName, entry); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if entry != nil {
+		appReplyUrls, err := r.getReplyUrls(entry.AppId)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
-		e := &Entry{AppId: id, Uri: host}
-		b, _ := e.Serialize()
-		r.db.Put(key, b.Bytes())
-		l.Info("Added reply-url", "Resource Name", req.Name, "Host", host)
-	} else {
-		// check if an entry is in db
-		data, _ := r.db.Get(key)
-		if len(data) != 0 {
-			// if a value for the resource was present, then the annotation must have been removed
-			e, err := DecodeEntry(bytes.NewBuffer(data))
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			host := e.Uri
-
-			app, err := r.GraphClient.ApplicationsById(e.AppId).Get(nil)
+		sort.Strings(appReplyUrls) // entry.ReplyUrls are already sorted
+		diff, result := DiffStringArrays(entry.ReplyUrls, appReplyUrls)
+		if len(diff) > 0 {
+			err = r.updateReplyUrl(result, entry.AppId)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 
-			Uris := app.GetWeb().GetRedirectUris()
-			sort.Strings(Uris)
-			i := sort.SearchStrings(Uris, host)
-			if i < len(Uris) {
-				err = r.GraphClient.ApplicationsById(e.AppId).Patch(
-					&item.ApplicationRequestBuilderPatchOptions{
-						Body: NewUpdateRedirectUrisRequestBody(append(Uris[:i], Uris[i+1:]...)),
-					},
-				)
-				if err != nil {
-					return ctrl.Result{}, err
-				}
-				r.db.Delete(key)
-				l.Info("Removed reply-url", "Resource Name", req.Name, "Host", host)
+			if err := r.Delete(req.NamespacedName); err != nil {
+				return ctrl.Result{}, err
 			}
+
+			l.Info("Removed reply-url", "Resource Name", req.Name, "Host", diff)
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *IngressReconciler) getReplyUrls(appObjectID string) ([]string, error) {
+	app, err := r.GraphClient.ApplicationsById(appObjectID).Get(nil)
+	if err != nil {
+		return make([]string, 0), err
+	}
+	return app.GetWeb().GetRedirectUris(), nil
+}
+
+func (r *IngressReconciler) updateReplyUrl(replyUrls []string, appObjectID string) error {
+	if err := r.GraphClient.ApplicationsById(appObjectID).Patch(
+		&item.ApplicationRequestBuilderPatchOptions{
+			Body: NewUpdateRedirectUrisRequestBody(replyUrls),
+		},
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *IngressReconciler) Keys() []types.NamespacedName {
+	keys := []types.NamespacedName{}
+	for data := range r.db.Keys() {
+		keyPtr := new(types.NamespacedName)
+
+		err := DecodeData(bytes.NewBuffer(data), keyPtr)
+		if err != nil {
+			continue
+		}
+
+		keys = append(keys, *keyPtr)
+	}
+
+	return keys
+}
+
+func (r *IngressReconciler) Put(key types.NamespacedName, entry Entry) error {
+	keyBuf, err := EncodeData(key)
+	if err != nil {
+		return err
+	}
+
+	entryData, err := EncodeData(entry)
+	if err != nil {
+		return err
+	}
+
+	if err = r.db.Put(keyBuf.Bytes(), entryData.Bytes()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *IngressReconciler) Get(key types.NamespacedName) (*Entry, error) {
+	entryPtr := new(Entry)
+
+	keyBuf, err := EncodeData(key)
+	if err != nil {
+		return nil, err
+	}
+
+	dataBytes, err := r.db.Get(keyBuf.Bytes())
+	if err != nil {
+		if err.Error() == "error: key not found" {
+			return nil, nil
 		}
 	}
 
-	return ctrl.Result{}, nil
+	err = DecodeData(bytes.NewBuffer(dataBytes), entryPtr)
+	if err != nil {
+		return nil, err
+	}
+
+	return entryPtr, err
+}
+
+func (r *IngressReconciler) Delete(key types.NamespacedName) error {
+	keyBuf, err := EncodeData(key)
+	if err != nil {
+		return err
+	}
+
+	if err = r.db.Delete(keyBuf.Bytes()); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	dbPtr, err := bitcask.Open(dbPath)
+	dbPtr, err := bitcask.Open(dbPath, bitcask.WithMaxKeySize(1024))
 	if err != nil {
 		return err
 	}
 
 	r.db = dbPtr
+
+	// reconcile the objects stored in the database
+	for _, nsn := range r.Keys() {
+		r.Reconcile(context.TODO(), reconcile.Request{NamespacedName: nsn})
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
