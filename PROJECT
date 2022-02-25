@@ -1,6 +1,7 @@
 domain: my.domain
 layout:
 - go.kubebuilder.io/v3
+multigroup: true
 projectName: azure-app-controller
 repo: app.example.com/m/v2
 resources:
@@ -9,5 +10,13 @@ resources:
   group: networking
   kind: Ingress
   path: k8s.io/api/networking/v1
+  version: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: my.domain
+  group: aum
+  kind: AppRegistration
+  path: app.example.com/m/v2/apis/aum/v1
   version: v1
 version: "3"

@@ -1,0 +1,6 @@
+apiVersion: aum.my.domain/v1
+kind: AppRegistration
+metadata:
+  name: appregistration-sample
+spec:
+  # TODO(user): Add fields here

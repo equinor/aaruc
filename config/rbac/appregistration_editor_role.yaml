@@ -1,0 +1,24 @@
+# permissions for end users to edit appregistrations.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: appregistration-editor-role
+rules:
+- apiGroups:
+  - aum.my.domain
+  resources:
+  - appregistrations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - aum.my.domain
+  resources:
+  - appregistrations/status
+  verbs:
+  - get
