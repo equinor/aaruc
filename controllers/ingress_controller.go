@@ -19,8 +19,10 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sort"
 
+	v1 "app.example.com/m/v2/apis/aum/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -60,20 +62,22 @@ type IngressReconciler struct {
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
-	// check the database
-	entry, dbErr := r.Get(req.NamespacedName)
-	if dbErr != nil {
-		return ctrl.Result{}, dbErr
-	}
-
 	ingress := new(networkingv1.Ingress)
 	r.Client.Get(ctx, req.NamespacedName, ingress)
 	appObjectID, ok := ingress.Annotations["azure-app-registration"]
 
 	if ok {
 		replyUrls := GetHostsFromIngress(ingress)
-		entry := Entry{AppId: appObjectID, ReplyUrls: replyUrls}
-		appReplyUrls, err := r.getReplyUrls(entry.AppId)
+
+		// get the associated app registration object and create it if it does not exist
+		appReg := new(v1.AppRegistration)
+		err := r.Client.Get(ctx, types.NamespacedName{Namespace: "", Name: appObjectID}, appReg)
+		if err != nil {
+			appReg.ObjectMeta.Name = appObjectID
+			r.Client.Create(ctx, appReg, &client.CreateOptions{})
+		}
+
+		appReplyUrls, err := r.getReplyUrls(appReg.ObjectMeta.Name)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -82,7 +86,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		sort.Strings(appReplyUrls)
 		diff, result := MergeStringArrays(replyUrls, appReplyUrls)
 		if len(diff) > 0 {
-			err = r.updateReplyUrl(result, entry.AppId)
+			err = r.updateReplyUrl(result, appReg.ObjectMeta.Name)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -90,19 +94,24 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			l.Info("Added reply-urls", "Resource Name", req.Name, "Reply URLs", diff)
 		}
 
-		if err = r.Put(req.NamespacedName, entry); err != nil {
+		if appReg.Status.IngressReferences == nil {
+			appReg.Status.IngressReferences = make(map[string][]string)
+		}
+		appReg.Status.IngressReferences[req.NamespacedName.String()] = replyUrls
+		if err = r.Status().Update(ctx, appReg); err != nil {
 			return ctrl.Result{}, err
 		}
-	} else if entry != nil {
-		appReplyUrls, err := r.getReplyUrls(entry.AppId)
+		_ = replyUrls
+	} else if appReg, err := r.SearchAppRegistrations(req.NamespacedName); err == nil {
+		appReplyUrls, err := r.getReplyUrls(appReg.ObjectMeta.Name)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
 		sort.Strings(appReplyUrls) // entry.ReplyUrls are already sorted
-		diff, result := DiffStringArrays(entry.ReplyUrls, appReplyUrls)
+		diff, result := DiffStringArrays(appReg.Status.IngressReferences[req.NamespacedName.String()], appReplyUrls)
 		if len(diff) > 0 {
-			err = r.updateReplyUrl(result, entry.AppId)
+			err = r.updateReplyUrl(result, appReg.ObjectMeta.Name)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -112,6 +121,11 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 
 			l.Info("Removed reply-url", "Resource Name", req.Name, "Host", diff)
+		}
+
+		delete(appReg.Status.IngressReferences, req.NamespacedName.String())
+		if err = r.Status().Update(ctx, appReg); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 	return ctrl.Result{}, nil
@@ -150,6 +164,22 @@ func (r *IngressReconciler) Keys() []types.NamespacedName {
 	}
 
 	return keys
+}
+
+func (r *IngressReconciler) SearchAppRegistrations(ingressName types.NamespacedName) (*v1.AppRegistration, error) {
+	appRegList := new(v1.AppRegistrationList)
+	err := r.Client.List(context.Background(), appRegList)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ar := range appRegList.Items {
+		if _, ok := ar.Status.IngressReferences[ingressName.String()]; ok {
+			return &ar, nil
+		}
+	}
+
+	return nil, errors.New("could not find an associated app registration")
 }
 
 func (r *IngressReconciler) Put(key types.NamespacedName, entry Entry) error {

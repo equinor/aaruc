@@ -18,7 +18,6 @@ package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -28,18 +27,18 @@ import (
 type AppRegistrationSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-
 }
 
 // AppRegistrationStatus defines the observed state of AppRegistration
 type AppRegistrationStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	IngressReferences []IngressReference `json:ingressreferences`
+	IngressReferences map[string][]string `json:"ingressreferences"`
 }
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:resource:scope=Cluster
 
 // AppRegistration is the Schema for the appregistrations API
 type AppRegistration struct {
@@ -61,9 +60,4 @@ type AppRegistrationList struct {
 
 func init() {
 	SchemeBuilder.Register(&AppRegistration{}, &AppRegistrationList{})
-}
-
-type IngressReference struct {
-	Name            types.NamespacedName `json:"name"`
-	ActiveReplyUrls []string             `json:"activereplyurls`
 }
